@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Nexus Player - Versão 5.0 (Estabilização Final)
+Nexus Player - Versão 5.1 (Estabilização Final com Correções)
 BaseWorker, DownloadWorker, Cache LRU, Índices, Tratamento de Exceções, Testes
 """
 
@@ -52,7 +52,7 @@ from PySide6.QtGui import QFont, QColor, QTextCharFormat, QTextCursor, QIcon, QP
 # ============================================================================
 
 APP_NAME = "Nexus Player"
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 BASE_DIR = Path(__file__).parent
 LOG_DIR = BASE_DIR / "logs"
 CONFIG_DIR = BASE_DIR / "config"
@@ -172,38 +172,39 @@ class Config:
         return cls._instance
 
     def _load(self):
-        config_file = CONFIG_DIR / "config.json"
-        default_config = {
-            "download_workers": 4,
-            "max_retries": 5,
-            "retry_delays": [5, 15, 30, 60, 120],
-            "download_folder": str(MUSIC_DIR),
-            "covers_folder": str(COVERS_DIR),
-            "cache_folder": str(CACHE_DIR),
-            "max_history": 100,
-            "auto_reload_playlist": True,
-            "default_quality": "192",
-            "language": "pt-BR",
-            "theme": "dark",
-            "last_player_folder": str(Path.home() / "Músicas" / "Nexus"),
-            "confidence_threshold": 70,
-            "log_unknown_variations": True,
-            "ffmpeg_path": "",
-            "duplicate_similarity_threshold": 0.92,
-            "preserve_case_list": ["AC/DC", "R.E.M.", "KSHMR", "DJ", "MC", "USA", "UK", "M.I.A.", "P!nk", "ABBA", "TLC", "B2K", "NSYNC", "MSTRKRFT"],
-            "ignore_articles": ["a", "an", "the", "of", "and", "or", "for", "with", "without", "in", "on", "at", "to", "from", "by", "as", "into", "through", "during", "including"]
-        }
-        if config_file.exists():
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    self._config = json.load(f)
-                logger.info("Configurações carregadas.", "CONFIG")
-            except Exception as e:
-                logger.error(f"Erro ao carregar configurações: {e}", "CONFIG")
+        with self._lock:  # Proteção contra escritas concorrentes
+            config_file = CONFIG_DIR / "config.json"
+            default_config = {
+                "download_workers": 4,
+                "max_retries": 5,
+                "retry_delays": [5, 15, 30, 60, 120],
+                "download_folder": str(MUSIC_DIR),
+                "covers_folder": str(COVERS_DIR),
+                "cache_folder": str(CACHE_DIR),
+                "max_history": 100,
+                "auto_reload_playlist": True,
+                "default_quality": "192",
+                "language": "pt-BR",
+                "theme": "dark",
+                "last_player_folder": str(Path.home() / "Músicas" / "Nexus"),
+                "confidence_threshold": 70,
+                "log_unknown_variations": True,
+                "ffmpeg_path": "",
+                "duplicate_similarity_threshold": 0.92,
+                "preserve_case_list": ["AC/DC", "R.E.M.", "KSHMR", "DJ", "MC", "USA", "UK", "M.I.A.", "P!nk", "ABBA", "TLC", "B2K", "NSYNC", "MSTRKRFT"],
+                "ignore_articles": ["a", "an", "the", "of", "and", "or", "for", "with", "without", "in", "on", "at", "to", "from", "by", "as", "into", "through", "during", "including"]
+            }
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        self._config = json.load(f)
+                    logger.info("Configurações carregadas.", "CONFIG")
+                except Exception as e:
+                    logger.error(f"Erro ao carregar configurações: {e}", "CONFIG")
+                    self._config = default_config
+            else:
                 self._config = default_config
-        else:
-            self._config = default_config
-            self._save()
+                self._save()
 
     def _save(self):
         config_file = CONFIG_DIR / "config.json"
@@ -557,9 +558,11 @@ class Database:
         return [dict(row) for row in rows]
 
     def close(self):
+        """Fecha a conexão com o banco de dados de forma segura."""
         if self._conn:
             self._conn.close()
             self._conn = None
+            logger.cache("Conexão com banco de dados fechada.")
 
 # ============================================================================
 # TASK MANAGER
@@ -1606,7 +1609,6 @@ class BaseWorker(QThread):
         except Exception as e:
             logger.error(f"Erro no worker {self.__class__.__name__}: {e}\n{traceback.format_exc()}", "THREAD")
             self.error_signal.emit(str(e))
-            # Marca a tarefa como falha se houver task_id
             if self.task_id:
                 TaskManager().complete_task(self.task_id, str(e))
         finally:
@@ -2003,7 +2005,7 @@ def solicitar_ffmpeg(parent=None) -> Optional[Path]:
     return None
 
 # ============================================================================
-# CACHE DE METADADOS (com LRU)
+# CACHE DE METADADOS (com LRU e validação de integridade)
 # ============================================================================
 
 class MetadataCache:
@@ -2089,6 +2091,14 @@ class MetadataCache:
             logger.error(f"Erro inesperado ao ler {file_path.name}: {e}", "CACHE")
             metadata['duration'] = 0.0
 
+        # Validação de integridade: verifica se o hash atual corresponde ao armazenado
+        stored_hash = metadata.get('file_hash')
+        if stored_hash:
+            current_hash = self._compute_file_hash(file_path)
+            if current_hash and current_hash != stored_hash:
+                logger.warning(f"Arquivo corrompido ou modificado: {file_path.name}", "CACHE")
+                metadata['corrupted'] = True
+
         return metadata
 
     def get_or_update(self, file_path: Path, force: bool = False) -> Dict[str, Any]:
@@ -2101,6 +2111,15 @@ class MetadataCache:
         row = self.db.fetchone("SELECT * FROM songs WHERE path = ?", (str(file_path),))
         if row and not force:
             data = dict(row)
+            # Verifica se o arquivo foi corrompido
+            if data.get('corrupted'):
+                logger.warning(f"Arquivo corrompido detectado no cache: {file_path.name}", "CACHE")
+                # Remove do cache e do banco
+                with self._lock:
+                    self._cache.invalidate(str(file_path))
+                self.db.execute("DELETE FROM songs WHERE path = ?", (str(file_path),))
+                # Recarrega
+                return self.get_or_update(file_path, force=True)
             with self._lock:
                 self._cache.put(str(file_path), data)
             return data
@@ -2133,7 +2152,8 @@ class MetadataCache:
             'file_hash': metadata.get('file_hash', ''),
             'normalized_artist': artist,
             'normalized_title': title,
-            'confidence': confidence
+            'confidence': confidence,
+            'corrupted': metadata.get('corrupted', False)
         }
         self.db.insert_song(song_data)
         with self._lock:
@@ -2344,6 +2364,7 @@ class MusicApp(QMainWindow):
         self.setGeometry(100, 100, 1200, 800)
         self._running_event = threading.Event()
         self._running_event.set()  # Inicia como True
+        self._active_workers: List[BaseWorker] = []  # Lista para encerramento seguro
 
         self.config = Config()
         self.cache = MetadataCache()
@@ -3299,6 +3320,7 @@ class MusicApp(QMainWindow):
         self._normalize_worker.finished_signal.connect(partial(self._on_normalize_collected, task.id))
         self._normalize_worker.error_signal.connect(partial(self._on_normalize_error, task.id))
         self._normalize_worker.start()
+        self._active_workers.append(self._normalize_worker)
 
     def _on_normalize_progress(self, progress: int, msg: str):
         self.append_log_normalizador(f"⏳ {msg}", "INFO")
@@ -3307,10 +3329,6 @@ class MusicApp(QMainWindow):
     def _on_normalize_collected(self, task_id: str):
         self.btn_normalizar.setEnabled(True)
         self.task_manager.update_progress(task_id, 100, "Coleta concluída")
-
-        # O worker não retorna a lista diretamente, então usamos um callback
-        # Na implementação atual, a lista de alterações não é passada de volta.
-        # Vamos simular com uma mensagem.
         self.append_log_normalizador("✅ Normalização concluída.", "SUCCESS")
         self._update_norm_status("Concluído", 100)
         self.task_manager.complete_task(task_id)
@@ -3720,6 +3738,7 @@ class MusicApp(QMainWindow):
         self._import_worker.error_signal.connect(lambda msg: self.append_log_player(f"❌ {msg}", "ERROR"))
         self._import_worker.finished_signal.connect(partial(self._import_finished, task.id))
         self._import_worker.start()
+        self._active_workers.append(self._import_worker)
 
         self.progress_dialog.canceled.connect(self._cancel_import)
         for widget in self.findChildren(QPushButton):
@@ -3788,6 +3807,7 @@ class MusicApp(QMainWindow):
         self._reload_worker.finished_signal.connect(partial(self._on_reload_finished, task.id))
         self._reload_worker.error_signal.connect(partial(self._on_reload_error, task.id))
         self._reload_worker.start()
+        self._active_workers.append(self._reload_worker)
 
     def _on_reload_progress(self, value: int, msg: str):
         self.append_log_player(f"⏳ {msg}", "INFO")
@@ -3946,37 +3966,38 @@ class MusicApp(QMainWindow):
     # ========================================================================
 
     def closeEvent(self, event) -> None:
-        self._running_event.clear()  # sinaliza que está encerrando
+        logger.info("Iniciando encerramento da aplicação...", "GENERAL")
+        self._running_event.clear()
 
-        # Cancela workers
-        if self._reload_worker and self._reload_worker.isRunning():
-            self._reload_worker.cancel()
-            self._reload_worker.wait(2000)
-        if self._normalize_worker and self._normalize_worker.isRunning():
-            self._normalize_worker.cancel()
-            self._normalize_worker.wait(2000)
-        if hasattr(self, '_import_worker') and self._import_worker and self._import_worker.isRunning():
-            self._import_worker.cancel()
-            self._import_worker.wait(2000)
+        # 1. Cancela todos os workers ativos
+        for worker in self._active_workers:
+            if worker.isRunning():
+                worker.cancel()
+                if not worker.wait(5000):  # timeout de 5 segundos
+                    logger.warning(f"Worker {worker.__class__.__name__} não finalizou a tempo.", "THREAD")
+                    worker.terminate()
+        self._active_workers.clear()
 
-        # Cancela downloads
+        # 2. Cancela downloads pendentes
         self.download_engine.cancel()
 
-        # Para o player
+        # 3. Para o player
         self.player.stop()
         self.player.setSource(QUrl())
 
-        # Para timers
+        # 4. Para timers
         if self._task_update_timer:
             self._task_update_timer.stop()
         if self._status_update_timer:
             self._status_update_timer.stop()
 
-        # Fecha banco
-        self.db.close()
+        # 5. Fecha banco de dados
+        try:
+            self.db.close()
+        except Exception as e:
+            logger.error(f"Erro ao fechar banco de dados: {e}", "CACHE")
 
-        # Aguarda threads finalizarem
-        time.sleep(0.3)
+        logger.info("Aplicação encerrada com sucesso.", "GENERAL")
         event.accept()
 
 # ============================================================================
