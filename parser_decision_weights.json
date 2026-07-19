@@ -1,0 +1,42 @@
+{
+  "REMOVE_VEVO": {
+    "weight": 1.0,
+    "count": 2,
+    "accepted": 2
+  },
+  "REMOVE_OFFICIAL": {
+    "weight": 1.0,
+    "count": 0,
+    "accepted": 0
+  },
+  "REMOVE_CHANNEL": {
+    "weight": 1.0,
+    "count": 0,
+    "accepted": 0
+  },
+  "REMOVE_TOPIC": {
+    "weight": 1.0,
+    "count": 0,
+    "accepted": 0
+  },
+  "REMOVE_SEPARATOR": {
+    "weight": 0.0,
+    "count": 0,
+    "accepted": 0
+  },
+  "REMOVE_DOUBLE_SEPARATOR": {
+    "weight": 1.0,
+    "count": 0,
+    "accepted": 0
+  },
+  "REMOVE_HASHTAG": {
+    "weight": 1.0,
+    "count": 0,
+    "accepted": 0
+  },
+  "REMOVE_PROMOTION": {
+    "weight": 1.0,
+    "count": 5,
+    "accepted": 5
+  }
+}
